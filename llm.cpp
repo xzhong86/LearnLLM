@@ -1,5 +1,6 @@
 // start with llama.c project, with tinystories model.
 
+#include <vector>
 #include <string>
 #include <fstream>
 #include <iostream>
@@ -9,6 +10,10 @@
 #include <unistd.h>    // for poxis open
 #include <sys/mman.h>  // for poxis mmap
 
+#define throw_error(MSG) do { throw std::runtime_error(MSG); } while (0)
+
+using std::string;
+using std::vector;
 
 // llm config struct, also is file header. copy from llama.c/run.c
 struct Config {
@@ -42,7 +47,39 @@ struct TransformerWeights {
 };
 
 
-using std::string;
+// from llama2.c/run.c, but C++ version.
+struct RunState {
+    // current wave of activations
+    vector<float> x; // activation at current time stamp (dim,)
+    vector<float> xb; // same, but inside a residual branch (dim,)
+    vector<float> xb2; // an additional buffer just for convenience (dim,)
+    vector<float> hb; // buffer for hidden dimension in the ffn (hidden_dim,)
+    vector<float> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    vector<float> q; // query (dim,)
+    vector<float> k; // key (dim,)
+    vector<float> v; // value (dim,)
+    vector<float> att; // buffer for scores/attention values (n_heads, seq_len)
+    vector<float> logits; // output logits
+    // kv cache
+    vector<float> key_cache;   // (layer, seq_len, dim)
+    vector<float> value_cache; // (layer, seq_len, dim)
+
+    RunState(Config *p) {
+        int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+        x.resize  (p->dim, 0);
+        xb.resize (p->dim, 0);
+        xb2.resize(p->dim, 0);
+        hb.resize (p->hidden_dim, 0);
+        hb2.resize(p->hidden_dim, 0);
+        q.resize  (p->dim, 0);
+        key_cache.resize  (p->n_layers * p->seq_len * kv_dim, 0);
+        value_cache.resize(p->n_layers * p->seq_len * kv_dim, 0);
+        att.resize(p->n_heads * p->seq_len, 0);
+        logits.resize(p->vocab_size, 0);
+    }
+    ~RunState() {}
+};
+
 
 class OSMemMap {
     int fd = -1;
@@ -58,11 +95,11 @@ public:
         }
     }
     void load(const char *path) {
-        if (fd != -1) throw std::runtime_error("bad load twice.");
+        if (fd != -1) throw_error("bad load twice.");
         fd = open(path, O_RDONLY);
-        if (fd == -1) throw std::runtime_error("open file failed.");
+        if (fd == -1) throw_error("open file failed.");
         ptr = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (ptr == MAP_FAILED) throw std::runtime_error("mmap failed!\n");
+        if (ptr == MAP_FAILED) throw_error("mmap failed!\n");
     }
     template <typename T>
     T *getPtr() const { return static_cast<T*>(ptr); }
@@ -73,18 +110,19 @@ class LLM {
     Config cfg_;
     OSMemMap mmap_;
     TransformerWeights *weights_ = nullptr;
+    RunState *run_state_ = nullptr;
 
 public:
     LLM(string path) : model_path_(path) {
         loadModel();
+        run_state_ = new RunState(&cfg_);
     }
     void loadModel() {
         std::ifstream ifs(model_path_, std::ios::binary);
-        if (!ifs.good()) throw std::runtime_error("open file failed.");
+        if (!ifs.good()) throw_error("open file failed.");
         ifs.read(reinterpret_cast<char*>(&cfg_), sizeof(cfg_));
         ifs.close();
         dumpConfig();
-
         loadParametersMMap();
     }
     void loadParametersMMap() {
@@ -134,6 +172,8 @@ public:
                   << "\nseq_len = " << cfg_.seq_len
                   << std::endl;
     }
+
+    ;
 };
 
 int main(int ac, char *av[])
