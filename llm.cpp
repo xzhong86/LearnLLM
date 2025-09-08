@@ -80,6 +80,54 @@ struct RunState {
     ~RunState() {}
 };
 
+template <typename T>
+inline void isread(T *p, std::istream &is) {
+    is.read(reinterpret_cast<char*>(p), sizeof(T));
+}
+template <typename T>
+inline void isread(T *p, int n, std::istream &is) {
+    is.read(reinterpret_cast<char*>(p), sizeof(T) * n);
+}
+
+struct TokenIndex {
+    char *str;
+    int id;
+};
+struct Tokenizer {
+    vector<char*> vocab;
+    vector<float> vocab_scores;
+    TokenIndex *sorted_vocab = nullptr;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512]; // stores all single-byte strings
+
+    Tokenizer(string tokenizer_path, int vocab_size)
+        : vocab(vocab_size, nullptr), vocab_scores(vocab_size), vocab_size(vocab_size) {
+        for (int i = 0; i < 256; i++) {
+            byte_pieces[i * 2] = (unsigned char)i;
+            byte_pieces[i * 2 + 1] = '\0';
+        }
+        std::ifstream ifs(tokenizer_path, std::ios_base::binary);
+        if (!ifs.good()) throw_error("open tokenizer failed.");
+        isread(&max_token_length, ifs);
+        int len;
+        for (int i = 0; i < vocab_size; i++) {
+            isread(&vocab_scores[i], ifs);
+            isread(&len, ifs);
+            vocab[i] = new char[len];
+            isread(vocab[i], len, ifs);
+            vocab[i][len] = '\0';
+        }
+        ifs.close();
+    }
+    ~Tokenizer() {
+        for (int i = 0; i < vocab_size; i++)
+            delete [] vocab[i];
+        if (sorted_vocab)
+            delete [] sorted_vocab;
+    }
+};
+
 
 class OSMemMap {
     int fd = -1;
@@ -111,19 +159,23 @@ class LLM {
     OSMemMap mmap_;
     TransformerWeights *weights_ = nullptr;
     RunState *run_state_ = nullptr;
+    Tokenizer *tokenizer_ = nullptr;
 
 public:
+    LLM() { }
     LLM(string path) : model_path_(path) {
-        loadModel();
-        run_state_ = new RunState(&cfg_);
+        loadModel(path);
     }
-    void loadModel() {
+    void loadModel(string path) {
+        if (model_path_.empty()) model_path_ = path;
+        else if (run_state_) throw_error("load model twice!");
         std::ifstream ifs(model_path_, std::ios::binary);
         if (!ifs.good()) throw_error("open file failed.");
-        ifs.read(reinterpret_cast<char*>(&cfg_), sizeof(cfg_));
+        isread(&cfg_, ifs);
         ifs.close();
         dumpConfig();
         loadParametersMMap();
+        run_state_ = new RunState(&cfg_);
     }
     void loadParametersMMap() {
         mmap_.load(model_path_.c_str());
@@ -173,7 +225,10 @@ public:
                   << std::endl;
     }
 
-    ;
+    void loadTokenizer(string path) {
+        std::cout << "load tokenizer " << path << " ...\n";
+        tokenizer_ = new Tokenizer(path, cfg_.vocab_size);
+    }
 };
 
 int main(int ac, char *av[])
@@ -182,5 +237,7 @@ int main(int ac, char *av[])
         std::cout << "error: need model!\n";
         return -1;
     }
-    LLM llm(av[1]);
+    LLM llm;
+    llm.loadModel(av[1]);
+    llm.loadTokenizer("../llama2-c/tokenizer.bin");
 }
