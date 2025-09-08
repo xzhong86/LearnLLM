@@ -129,6 +129,26 @@ struct Tokenizer {
 };
 
 
+// ----------------------------------------------------------------------------
+// Sampler
+struct ProbIndex {
+    float prob;
+    int index;
+}; // struct used when sorting probabilities during top-p sampling
+struct Sampler {
+    int vocab_size;
+    float temperature;
+    float topp;
+    unsigned long rng_state;
+    vector<ProbIndex> probindex; // buffer used in top-p sampling
+
+    Sampler(int size, float temp, float topp, unsigned long seed)
+        : vocab_size(size), temperature(temp), topp(topp), rng_state(seed), probindex(size) {
+    }
+    ~Sampler() {}
+};
+
+
 class OSMemMap {
     int fd = -1;
     size_t file_size;
