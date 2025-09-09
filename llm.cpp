@@ -5,6 +5,8 @@
 #include <fstream>
 #include <iostream>
 //#include <stdexcept>
+#include <map>
+#include <format>
 
 #include <fcntl.h>     // for O_RDONLY
 #include <unistd.h>    // for poxis open
@@ -89,14 +91,18 @@ inline void isread(T *p, int n, std::istream &is) {
     is.read(reinterpret_cast<char*>(p), sizeof(T) * n);
 }
 
-struct TokenIndex {
-    char *str;
-    int id;
+struct TokenStr {
+    const char *str;
+    TokenStr(const char *s) : str(s) { }
+    bool operator<(const TokenStr &rhl) const {
+        return std::strcmp(str, rhl.str) < 0;
+    }
 };
+
 struct Tokenizer {
     vector<char*> vocab;
     vector<float> vocab_scores;
-    TokenIndex *sorted_vocab = nullptr;
+    std::map<TokenStr, int> vocab_map;
     int vocab_size;
     unsigned int max_token_length;
     unsigned char byte_pieces[512]; // stores all single-byte strings
@@ -123,10 +129,72 @@ struct Tokenizer {
     ~Tokenizer() {
         for (int i = 0; i < vocab_size; i++)
             delete [] vocab[i];
-        if (sorted_vocab)
-            delete [] sorted_vocab;
     }
+
+    // relate to str_lookup
+    int lookupToken(const string &str) {
+        auto it = vocab_map.find(TokenStr(str.c_str()));
+        return it == vocab_map.end() ? -1 : it->second;
+    }
+
+    vector<int> encode(string &text, int8_t bos, int8_t eos) {
+        if (vocab_map.empty()) {
+            for (int i = 0; i < vocab_size; i++)
+                vocab_map.insert({vocab[i], i});
+        }
+
+        vector<int> tokens;
+        if (bos) tokens.push_back(1);
+        if (!text.empty()) // for some bug, refer to llama.c/run.c
+            tokens.push_back(lookupToken(" ")); // append prefix
+
+        // work with UTF-8
+        string str_buffer;
+        for (auto it = text.begin(); it != text.end(); ) {
+            str_buffer.clear();
+            str_buffer.push_back(*it);
+            if ((*it & 0xc0) == 0xc0) {  // start utf-8 sequence
+                for (++it ; (*it & 0xc0) == 0x80; ++it)
+                    str_buffer.push_back(*it);
+            }
+            else
+                ++it;
+            int id = lookupToken(str_buffer);
+            if (id != -1)
+                tokens.push_back(id);
+            else  // byte encode fallback, see llama2.c/run.c
+                for (char c: str_buffer)
+                    tokens.push_back(int(c) + 3);
+        }
+
+        // try merge pair with best score
+        while (tokens.size() > 1) {
+            //bool  has_best = false;
+            float best_score = -1e10;
+            int   best_id  = -1;
+            auto  best_it  = tokens.end();
+            for (auto it = tokens.begin(); it + 1 != tokens.end(); ++it) {
+                auto nit = std::next(it);
+                string str = std::format("{}{}", vocab[*it], vocab[*nit]);
+                int id = lookupToken(str);
+                if (id != -1 && vocab_scores[id] > best_score) {
+                    best_it = it;
+                    best_id = id;
+                    best_score = vocab_scores[id];
+                }
+            }
+            if (best_it == tokens.end())  // no best/better
+                break;
+            *best_it = best_id;
+            tokens.erase(std::next(best_it));
+        }
+
+        if (eos) tokens.push_back(2);
+        return tokens;
+    }
+
 };
+
 
 
 // ----------------------------------------------------------------------------
@@ -249,7 +317,17 @@ public:
         std::cout << "load tokenizer " << path << " ...\n";
         tokenizer_ = new Tokenizer(path, cfg_.vocab_size);
     }
+
+    void generate(string prompt, int steps) {
+        vector<int> prompt_tokens = tokenizer_->encode(prompt, 1, 0);
+        if (prompt_tokens.size() == 0)
+            throw_error("fail on prompt_tokens");
+
+        // main loop
+        ; // notice, continue here
+    }
 };
+
 
 int main(int ac, char *av[])
 {
@@ -260,4 +338,8 @@ int main(int ac, char *av[])
     LLM llm;
     llm.loadModel(av[1]);
     llm.loadTokenizer("../llama2-c/tokenizer.bin");
+
+    string prompt;
+    int steps = 256;
+    llm.generate(prompt, steps);
 }
