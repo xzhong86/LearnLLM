@@ -12,6 +12,8 @@
 #include <unistd.h>    // for poxis open
 #include <sys/mman.h>  // for poxis mmap
 
+#include "nntools.hpp"
+
 #define throw_error(MSG) do { throw std::runtime_error(MSG); } while (0)
 
 using std::string;
@@ -52,14 +54,14 @@ struct TransformerWeights {
 // from llama2.c/run.c, but C++ version.
 struct RunState {
     // current wave of activations
-    vector<float> x; // activation at current time stamp (dim,)
-    vector<float> xb; // same, but inside a residual branch (dim,)
+    vector<float> x;   // activation at current time stamp (dim,)
+    vector<float> xb;  // same, but inside a residual branch (dim,)
     vector<float> xb2; // an additional buffer just for convenience (dim,)
-    vector<float> hb; // buffer for hidden dimension in the ffn (hidden_dim,)
+    vector<float> hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
     vector<float> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    vector<float> q; // query (dim,)
-    vector<float> k; // key (dim,)
-    vector<float> v; // value (dim,)
+    vector<float> q;   // query (dim,)
+    float* k;          // key (dim,)
+    float* v;          // value (dim,)
     vector<float> att; // buffer for scores/attention values (n_heads, seq_len)
     vector<float> logits; // output logits
     // kv cache
@@ -196,7 +198,6 @@ struct Tokenizer {
 };
 
 
-
 // ----------------------------------------------------------------------------
 // Sampler
 struct ProbIndex {
@@ -318,16 +319,212 @@ public:
         tokenizer_ = new Tokenizer(path, cfg_.vocab_size);
     }
 
+    void forwardLayer(int pos, int i_layer) {
+        using namespace nn;
+        Config* p = &cfg_;
+        TransformerWeights* w = weights_;
+        RunState *s = run_state_;
+        float    *x = s->x.data();  // activation at current time stamp (dim,)
+
+        int dim    = p->dim;
+        int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+        int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
+        int hidden_dim =  p->hidden_dim;
+        int head_size  = dim / p->n_heads;
+
+        // forward layer
+
+        // attention rmsnorm
+        rmsnorm(s->xb, x, w->rms_att_weight + i_layer*dim, dim);
+
+        // key and value point to the kv cache
+        int loff = i_layer * p->seq_len * kv_dim; // kv cache layer offset for convenience
+        s->k = s->key_cache.data() + loff + pos * kv_dim;
+        s->v = s->value_cache.data() + loff + pos * kv_dim;
+
+        // qkv matmuls for this position
+        matmul(s->q, s->xb, w->wq + i_layer*dim*dim,    dim, dim);
+        matmul(s->k, s->xb, w->wk + i_layer*dim*kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv + i_layer*dim*kv_dim, dim, kv_dim);
+
+        // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        for (int i = 0; i < dim; i+=2) {
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+            for (int v = 0; v < rotn; v++) {
+                float *vec = v == 0 ? s->q.data() : s->k; // the vector to rotate (query or key)
+                float v0 = vec[i];
+                float v1 = vec[i+1];
+                vec[i]   = v0 * fcr - v1 * fci;
+                vec[i+1] = v0 * fci + v1 * fcr;
+            }
+        }
+
+        // multihead attention. iterate over all heads
+        int h;
+        //#pragma omp parallel for private(h)
+        for (h = 0; h < p->n_heads; h++) {
+            // get the query vector for this head
+            float* q = s->q.data() + h * head_size;
+            // attention scores for this head
+            float* att = s->att.data() + h * p->seq_len;
+            // iterate over all timesteps, including the current one
+            for (int t = 0; t <= pos; t++) {
+                // get the key vector for this head and at this timestep
+                float* k = s->key_cache.data() + loff + t * kv_dim + (h / kv_mul) * head_size;
+                // calculate the attention score as the dot product of q and k
+                float score = 0.0f;
+                for (int i = 0; i < head_size; i++) {
+                    score += q[i] * k[i];
+                }
+                score /= sqrtf(head_size);
+                // save the score to the attention buffer
+                att[t] = score;
+            }
+
+            // softmax the scores to get attention weights, from 0..pos inclusively
+            softmax(att, pos + 1);
+
+            // weighted sum of the values, store back into xb
+            float* xb = s->xb.data() + h * head_size;
+            memset(xb, 0, head_size * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                // get the value vector for this head and at this timestep
+                float* v = s->value_cache.data() + loff + t * kv_dim + (h / kv_mul) * head_size;
+                // get the attention weight for this timestep
+                float a = att[t];
+                // accumulate the weighted value into xb
+                for (int i = 0; i < head_size; i++) {
+                    xb[i] += a * v[i];
+                }
+            }
+        }
+
+        // final matmul to get the output of the attention
+        matmul(s->xb2, s->xb, w->wo + i_layer*dim*dim, dim, dim);
+
+        // residual connection back into x
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
+
+        // ffn rmsnorm
+        rmsnorm(s->xb, x, w->rms_ffn_weight + i_layer*dim, dim);
+
+        // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
+        // first calculate self.w1(x) and self.w3(x)
+        matmul(s->hb, s->xb, w->w1 + i_layer*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3 + i_layer*dim*hidden_dim, dim, hidden_dim);
+
+        // SwiGLU non-linearity
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = s->hb[i];
+            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+            val *= (1.0f / (1.0f + expf(-val)));
+            // elementwise multiply with w3(x)
+            val *= s->hb2[i];
+            s->hb[i] = val;
+        }
+
+        // final matmul to get the output of the ffn
+        matmul(s->xb, s->hb, w->w2 + i_layer*dim*hidden_dim, hidden_dim, dim);
+
+        // residual connection
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
+    }
+
+    float* forward(int token, int pos) {
+        using namespace nn;
+        // a few convenience variables
+        Config* p = &cfg_;
+        TransformerWeights* w = weights_;
+        RunState *s = run_state_;
+        float    *x = s->x.data();  // activation at current time stamp (dim,)
+
+        int dim    = p->dim;
+        //int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+        //int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
+        //int hidden_dim =  p->hidden_dim;
+        //int head_size  = dim / p->n_heads;
+
+        // copy the token embedding into x
+        float* content_row = w->token_embedding_table + token * dim;
+        memcpy(x, content_row, dim*sizeof(*x));
+
+        // forward all the layers
+        for(int l = 0; l < p->n_layers; l++)
+            forwardLayer(pos, l);
+
+        // final rmsnorm
+        rmsnorm(x, x, w->rms_final_weight, dim);
+
+        // classifier into logits
+        matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+        return s->logits.data();
+    }
+
     void generate(string prompt, int steps) {
         vector<int> prompt_tokens = tokenizer_->encode(prompt, 1, 0);
         if (prompt_tokens.size() == 0)
             throw_error("fail on prompt_tokens");
 
         // main loop
-        ; // notice, continue here
+        long start = 0;  // used to time our code, only initialized after first iteration
+        int next;        // will store the next token in the sequence
+        int token = prompt_tokens[0]; // kick off with the first token in the prompt
+        int pos = 0;     // position in the sequence
+        while (pos < steps) {
+            float* logits = forward(token, pos);
+            (void)logits;
+            break;
+        }
     }
 };
 
+#if 0
+void dummy() {
+    // start the main loop
+    long start = 0;  // used to time our code, only initialized after first iteration
+    int next;        // will store the next token in the sequence
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int pos = 0;     // position in the sequence
+    while (pos < steps) {
+
+        // forward the transformer to get logits for the next token
+        float* logits = forward(transformer, token, pos);
+
+        // advance the state machine
+        if (pos < num_prompt_tokens - 1) {
+            // if we are still processing the input prompt, force the next prompt token
+            next = prompt_tokens[pos + 1];
+        } else {
+            // otherwise sample the next token from the logits
+            next = sample(sampler, logits);
+        }
+        pos++;
+
+        // data-dependent terminating condition: the BOS (=1) token delimits sequences
+        if (next == 1) { break; }
+
+        // print the token as string, decode it with the Tokenizer object
+        char* piece = decode(tokenizer, token, next);
+        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        fflush(stdout);
+        token = next;
+
+        // init the timer here because the first iteration can be slower
+        if (start == 0) { start = time_in_ms(); }
+    }
+    printf("\n");
+
+}
+#endif
 
 int main(int ac, char *av[])
 {
