@@ -195,6 +195,19 @@ struct Tokenizer {
         return tokens;
     }
 
+    char* decode(int prev_token, int token) {
+        char *piece = vocab[token];
+        if (prev_token == 1 && piece[0] == ' ') { piece++; }
+        // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+        // parse this and convert and return the actual byte
+        unsigned char byte_val;
+        if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+            piece = (char*)byte_pieces + byte_val * 2;
+        }
+        return piece;
+    }
+
+
 };
 
 
@@ -329,6 +342,20 @@ struct Sampler {
 
 };
 
+void safe_print(char *piece) {
+    // piece might be a raw byte token, and we only want to print printable chars or whitespace
+    // because some of the other bytes can be various control codes, backspace, etc.
+    if (piece == NULL) { return; }
+    if (piece[0] == '\0') { return; }
+    if (piece[1] == '\0') {
+        unsigned char byte_val = piece[0];
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return; // bad byte, don't print it
+        }
+    }
+    std::cout << piece;
+    std::cout.flush();
+}
 
 
 class OSMemMap {
@@ -434,7 +461,7 @@ public:
     }
 
     void initSampler() {
-        float temperature = 1.0f;
+        float temperature = 0.0f;
         float topp = 0.9f;
         unsigned long long rng_seed = 1234;
         sampler_ = new Sampler(cfg_.vocab_size, temperature, topp, rng_seed);
@@ -605,49 +632,17 @@ public:
             pos ++;
 
             if (next == 1) break;
-            break;
+
+            // print the token as string, decode it with the Tokenizer object
+            char* piece = tokenizer_->decode(token, next);
+            safe_print(piece); // print string, but skips "unsafe" bytes
+            //fflush(stdout);
+            token = next;
         }
+        std::cout << std::endl;
     }
 };
 
-#if 0
-void dummy() {
-    // start the main loop
-    long start = 0;  // used to time our code, only initialized after first iteration
-    int next;        // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;     // position in the sequence
-    while (pos < steps) {
-
-        // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
-
-        // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
-            // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos + 1];
-        } else {
-            // otherwise sample the next token from the logits
-            next = sample(sampler, logits);
-        }
-        pos++;
-
-        // data-dependent terminating condition: the BOS (=1) token delimits sequences
-        if (next == 1) { break; }
-
-        // print the token as string, decode it with the Tokenizer object
-        char* piece = decode(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-        fflush(stdout);
-        token = next;
-
-        // init the timer here because the first iteration can be slower
-        if (start == 0) { start = time_in_ms(); }
-    }
-    printf("\n");
-
-}
-#endif
 
 int main(int ac, char *av[])
 {
