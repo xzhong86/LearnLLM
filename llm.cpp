@@ -4,17 +4,13 @@
 #include <string>
 #include <fstream>
 #include <iostream>
-//#include <stdexcept>
 #include <map>
 #include <format>
 
-#include <fcntl.h>     // for O_RDONLY
-#include <unistd.h>    // for poxis open
-#include <sys/mman.h>  // for poxis mmap
-
 #include "nntools.hpp"
+#include "llm-utils.hpp"
 
-#define throw_error(MSG) do { throw std::runtime_error(MSG); } while (0)
+using namespace llm;
 
 using std::string;
 using std::vector;
@@ -84,14 +80,6 @@ struct RunState {
     ~RunState() {}
 };
 
-template <typename T>
-inline void isread(T *p, std::istream &is) {
-    is.read(reinterpret_cast<char*>(p), sizeof(T));
-}
-template <typename T>
-inline void isread(T *p, int n, std::istream &is) {
-    is.read(reinterpret_cast<char*>(p), sizeof(T) * n);
-}
 
 struct TokenStr {
     const char *str;
@@ -117,13 +105,13 @@ struct Tokenizer {
         }
         std::ifstream ifs(tokenizer_path, std::ios_base::binary);
         if (!ifs.good()) throw_error("open tokenizer failed.");
-        isread(&max_token_length, ifs);
+        read_from(&max_token_length, ifs);
         int len;
         for (int i = 0; i < vocab_size; i++) {
-            isread(&vocab_scores[i], ifs);
-            isread(&len, ifs);
+            read_from(&vocab_scores[i], ifs);
+            read_from(&len, ifs);
             vocab[i] = new char[len];
-            isread(vocab[i], len, ifs);
+            read_from(vocab[i], len, ifs);
             vocab[i][len] = '\0';
         }
         ifs.close();
@@ -335,51 +323,12 @@ struct Sampler {
             //    // top-p (nucleus) sampling, clamping the least likely tokens to zero
             //    next = sample_topp(logits, vocab_size, topp, probindex, coin);
             //}
+            next = 0;
             throw_error("not support");
         }
         return next;
     }
 
-};
-
-void safe_print(char *piece) {
-    // piece might be a raw byte token, and we only want to print printable chars or whitespace
-    // because some of the other bytes can be various control codes, backspace, etc.
-    if (piece == NULL) { return; }
-    if (piece[0] == '\0') { return; }
-    if (piece[1] == '\0') {
-        unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
-            return; // bad byte, don't print it
-        }
-    }
-    std::cout << piece;
-    std::cout.flush();
-}
-
-
-class OSMemMap {
-    int fd = -1;
-    size_t file_size;
-    void *ptr;
-public:
-    OSMemMap() {}
-    OSMemMap(const char *path) { load(path); }
-    ~OSMemMap() {
-        if (fd != -1) {
-            if (ptr != MAP_FAILED) { munmap(ptr, file_size); }
-            close(fd);
-        }
-    }
-    void load(const char *path) {
-        if (fd != -1) throw_error("bad load twice.");
-        fd = open(path, O_RDONLY);
-        if (fd == -1) throw_error("open file failed.");
-        ptr = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (ptr == MAP_FAILED) throw_error("mmap failed!\n");
-    }
-    template <typename T>
-    T *getPtr() const { return static_cast<T*>(ptr); }
 };
 
 class LLM {
@@ -401,7 +350,7 @@ public:
         else if (run_state_) throw_error("load model twice!");
         std::ifstream ifs(model_path_, std::ios::binary);
         if (!ifs.good()) throw_error("open file failed.");
-        isread(&cfg_, ifs);
+        read_from(&cfg_, ifs);
         ifs.close();
         dumpConfig();
         loadParametersMMap();
@@ -409,7 +358,7 @@ public:
     }
     void loadParametersMMap() {
         mmap_.load(model_path_.c_str());
-        float *ptr = mmap_.getPtr<float>();
+        float *ptr = mmap_.getPtr<float>(sizeof(Config));
         weights_ = new TransformerWeights;
         auto *w = weights_;
         auto *p = &cfg_;
@@ -613,19 +562,34 @@ public:
         return s->logits.data();
     }
 
+    void printPiece(char *piece) {
+        // piece might be a raw byte token, and we only want to print printable chars or whitespace
+        // because some of the other bytes can be various control codes, backspace, etc.
+        if (piece == NULL) { return; }
+        if (piece[0] == '\0') { return; }
+        if (piece[1] == '\0') {
+            unsigned char byte_val = piece[0];
+            if (!(isprint(byte_val) || isspace(byte_val))) {
+                return; // bad byte, don't print it
+            }
+        }
+        std::cout << piece;
+        std::cout.flush();
+    }
+
     void generate(string prompt, int steps) {
         vector<int> prompt_tokens = tokenizer_->encode(prompt, 1, 0);
         if (prompt_tokens.size() == 0)
             throw_error("fail on prompt_tokens");
 
         // main loop
-        long start = 0;  // used to time our code, only initialized after first iteration
+        //long start = 0;  // used to time our code, only initialized after first iteration
         int next;        // will store the next token in the sequence
         int token = prompt_tokens[0]; // kick off with the first token in the prompt
         int pos = 0;     // position in the sequence
         while (pos < steps) {
             float* logits = forward(token, pos);
-            if (pos < prompt_tokens.size())
+            if (pos < prompt_tokens.size() - 1)
                 next = prompt_tokens[pos + 1];
             else
                 next = sampler_->sample(logits);
@@ -635,8 +599,8 @@ public:
 
             // print the token as string, decode it with the Tokenizer object
             char* piece = tokenizer_->decode(token, next);
-            safe_print(piece); // print string, but skips "unsafe" bytes
-            //fflush(stdout);
+            printPiece(piece); // print string, but skips "unsafe" bytes
+
             token = next;
         }
         std::cout << std::endl;
@@ -655,7 +619,8 @@ int main(int ac, char *av[])
     llm.loadTokenizer("../llama2-c/tokenizer.bin");
     llm.initSampler();
 
-    string prompt;
+    //string prompt("She is beautiful");
+    string prompt("");
     int steps = 256;
     llm.generate(prompt, steps);
 }

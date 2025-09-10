@@ -1,9 +1,9 @@
 
-cpps = llm.cpp nntools.cpp
-hpps = nntools.hpp
+cpps = llm.cpp llm-utils.cpp nntools.cpp
+hpps = llm-utils.hpp nntools.hpp
 
 run_llm: $(cpps) $(hpps)
-	$(CXX) -Wall -std=c++20 -ferror-limit=3 -o $@ $(cpps)
+	$(CXX) -Wall -std=c++20 -ferror-limit=3 -O -o $@ $(cpps)
 
 test: run_llm
 	./run_llm ../models/stories15M.bin
