@@ -409,11 +409,8 @@ public:
         tokenizer_ = new Tokenizer(path, cfg_.vocab_size);
     }
 
-    void initSampler() {
-        float temperature = 0.0f;
-        float topp = 0.9f;
-        unsigned long long rng_seed = 1234;
-        sampler_ = new Sampler(cfg_.vocab_size, temperature, topp, rng_seed);
+    void initSampler(float temperature, float topp, unsigned long seed) {
+        sampler_ = new Sampler(cfg_.vocab_size, temperature, topp, seed);
     }
 
     void forwardLayer(int pos, int i_layer) {
@@ -428,8 +425,6 @@ public:
         int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
         int hidden_dim =  p->hidden_dim;
         int head_size  = dim / p->n_heads;
-
-        // forward layer
 
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + i_layer*dim, dim);
@@ -610,14 +605,20 @@ public:
 
 int main(int ac, char *av[])
 {
-    if (ac < 2) {
-        std::cout << "error: need model!\n";
+    if (ac < 3) {
+        std::cerr << "error: need model and tokenizer!\n";
+        std::cout << "usage: run_llm path/to/model.bin path/to/tokenizer.bin\n";
         return -1;
     }
+
     LLM llm;
     llm.loadModel(av[1]);
-    llm.loadTokenizer("../llama2-c/tokenizer.bin");
-    llm.initSampler();
+    llm.loadTokenizer(av[2]);
+
+    float temperature = 0.0f;
+    float topp = 0.9f;
+    unsigned long rng_seed = 1234;
+    llm.initSampler(temperature, topp, rng_seed);
 
     //string prompt("She is beautiful");
     string prompt("");
