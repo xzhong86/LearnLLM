@@ -7,6 +7,7 @@
 #include <map>
 #include <format>
 
+#include "arrays.hpp"
 #include "nntools.hpp"
 #include "llm-utils.hpp"
 
