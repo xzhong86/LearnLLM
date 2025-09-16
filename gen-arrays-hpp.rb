@@ -50,6 +50,11 @@ end
 
 def gen_ArrayXD(cgen, dim)
   fail "bad dim" if dim < 2
+  do_check = false  # manually open this
+  def check_dimr(cgen, dr)
+    dr.each{ |d| cgen.puts "assert_msg(0 <= d#{d} && d#{d} < dim#{d}_, \"overmax\");" }
+  end
+
   cls_name = "Array#{dim}D"
   cgen.puts "template <typename T>"
   cgen.put_block("class #{cls_name}", "{", "};") do
@@ -64,6 +69,7 @@ def gen_ArrayXD(cgen, dim)
     cgen.puts "T*   raw()  const { return data_; }"
     1.upto(dim){ |d| cgen.puts "int d#{d}size() const { return dim#{d}_; }" }
     cgen.put_block("T& operator[](" + "int d{}".map_sub_join(1..dim) + ") const") do
+      check_dimr(cgen, 1..dim) if do_check
       darr = 1.upto(dim).map{|d| (d..dim).to_a }
       sstr = ["d{}"] + ["dim{}_"] * (dim - 1)
       istr = darr.map{|a| a.zip(sstr).map{|n,s| s.sub('{}', n.to_s) }.join('*') }.join(' + ')
@@ -72,6 +78,7 @@ def gen_ArrayXD(cgen, dim)
     1.upto(dim-1) do |axd|  # ArrayXD
       dimr = 1..(dim - axd)
       cgen.put_block("Array#{axd}D<T> operator[](" + "int d{}".map_sub_join(dimr) + ") const") do
+        check_dimr(cgen, dimr) if do_check
         darr = 1.upto(dim).map{|d| (d..dim).to_a }.slice(0, dim - axd)
         sstr = ["d{}"] + ["dim{}_"] * (dim - 1)
         istr = darr.map{|a| a.zip(sstr).map{|n,s| s.sub('{}', n.to_s) }.join('*') }.join(' + ')

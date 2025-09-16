@@ -54,15 +54,15 @@ struct TransformerWeights {
 // from llama2.c/run.c, but C++ version.
 struct RunState {
     // current wave of activations
-    Array1D<float> x;   // activation at current time stamp (dim,)
-    Array1D<float> xb;  // same, but inside a residual branch (dim,)
-    Array1D<float> xb2; // an additional buffer just for convenience (dim,)
-    Array1D<float> hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
-    Array1D<float> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    Array1D<float> q;   // query (dim,)
-    Array1D<float> k;   // key (dim,), just pointer
-    Array1D<float> v;   // value (dim,), just pointer
-    Array2D<float> att; // buffer for scores/attention values (n_heads, seq_len)
+    Array1D<float> x;      // activation at current time stamp (dim,)
+    Array1D<float> xb;     // same, but inside a residual branch (dim,)
+    Array1D<float> xb2;    // an additional buffer just for convenience (dim,)
+    Array1D<float> hb;     // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array1D<float> hb2;    // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array1D<float> q;      // query (dim,)
+    Array1D<float> k;      // key (dim,), just pointer
+    Array1D<float> v;      // value (dim,), just pointer
+    Array2D<float> att;    // buffer for scores/attention values (n_heads, seq_len)
     Array1D<float> logits; // output logits
     // kv cache
     Array3D<float> key_cache;   // (layer, seq_len, dim)
