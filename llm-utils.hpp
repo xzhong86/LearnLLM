@@ -49,6 +49,7 @@ public:
     ~OSMemMap();
 
     void load(const char *path);
+    size_t getMemSize() const { return file_size_; }
 
     template <typename T>
     T *getPtr(int offset_bytes) const {
@@ -58,4 +59,4 @@ public:
     }
 };
 
-}
+} // namespace llm

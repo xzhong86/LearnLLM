@@ -7,14 +7,16 @@
 #include <map>
 #include <format>
 
+#include "llm-utils.hpp"
 #include "arrays.hpp"
 #include "nntools.hpp"
-#include "llm-utils.hpp"
 
 using namespace llm;
+using namespace nn;
 
 using std::string;
 using std::vector;
+
 
 // llm config struct, also is file header. copy from llama.c/run.c
 struct Config {
@@ -28,55 +30,60 @@ struct Config {
 };
 struct TransformerWeights {
     // token embedding table
-    float* token_embedding_table;    // (vocab_size, dim)
+    Array2D<float> token_embedding_table; // (vocab_size, dim)
     // weights for rmsnorms
-    float* rms_att_weight; // (layer, dim) rmsnorm weights
-    float* rms_ffn_weight; // (layer, dim)
+    Array2D<float> rms_att_weight; // (layer, dim) rmsnorm weights
+    Array2D<float> rms_ffn_weight; // (layer, dim)
     // weights for matmuls. note dim == n_heads * head_size
-    float* wq; // (layer, dim, n_heads * head_size)
-    float* wk; // (layer, dim, n_kv_heads * head_size)
-    float* wv; // (layer, dim, n_kv_heads * head_size)
-    float* wo; // (layer, n_heads * head_size, dim)
+    Array3D<float> wq; // (layer, dim, n_heads * head_size)
+    Array3D<float> wk; // (layer, dim, n_kv_heads * head_size)
+    Array3D<float> wv; // (layer, dim, n_kv_heads * head_size)
+    Array3D<float> wo; // (layer, n_heads * head_size, dim)
     // weights for ffn
-    float* w1; // (layer, hidden_dim, dim)
-    float* w2; // (layer, dim, hidden_dim)
-    float* w3; // (layer, hidden_dim, dim)
+    Array3D<float> w1; // (layer, hidden_dim, dim)
+    Array3D<float> w2; // (layer, dim, hidden_dim)
+    Array3D<float> w3; // (layer, hidden_dim, dim)
     // final rmsnorm
-    float* rms_final_weight; // (dim,)
+    Array1D<float> rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
-    float* wcls;
+    //float* wcls;
+    Array2D<float> wcls;  // (vocab_size, dim)?
 };
 
 
 // from llama2.c/run.c, but C++ version.
 struct RunState {
     // current wave of activations
-    vector<float> x;   // activation at current time stamp (dim,)
-    vector<float> xb;  // same, but inside a residual branch (dim,)
-    vector<float> xb2; // an additional buffer just for convenience (dim,)
-    vector<float> hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
-    vector<float> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    vector<float> q;   // query (dim,)
-    float* k;          // key (dim,)
-    float* v;          // value (dim,)
-    vector<float> att; // buffer for scores/attention values (n_heads, seq_len)
-    vector<float> logits; // output logits
+    Array1D<float> x;   // activation at current time stamp (dim,)
+    Array1D<float> xb;  // same, but inside a residual branch (dim,)
+    Array1D<float> xb2; // an additional buffer just for convenience (dim,)
+    Array1D<float> hb;  // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array1D<float> hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    Array1D<float> q;   // query (dim,)
+    Array1D<float> k;   // key (dim,), just pointer
+    Array1D<float> v;   // value (dim,), just pointer
+    Array2D<float> att; // buffer for scores/attention values (n_heads, seq_len)
+    Array1D<float> logits; // output logits
     // kv cache
-    vector<float> key_cache;   // (layer, seq_len, dim)
-    vector<float> value_cache; // (layer, seq_len, dim)
+    Array3D<float> key_cache;   // (layer, seq_len, dim)
+    Array3D<float> value_cache; // (layer, seq_len, dim)
+
+    ArrayPool<float> pool_;
 
     RunState(Config *p) {
         int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-        x.resize  (p->dim, 0);
-        xb.resize (p->dim, 0);
-        xb2.resize(p->dim, 0);
-        hb.resize (p->hidden_dim, 0);
-        hb2.resize(p->hidden_dim, 0);
-        q.resize  (p->dim, 0);
-        key_cache.resize  (p->n_layers * p->seq_len * kv_dim, 0);
-        value_cache.resize(p->n_layers * p->seq_len * kv_dim, 0);
-        att.resize(p->n_heads * p->seq_len, 0);
-        logits.resize(p->vocab_size, 0);
+        pool_.alloc(p->dim*4 + p->hidden_dim*2 + p->n_layers * p->seq_len * kv_dim*2 +
+                    p->n_heads * p->seq_len + p->vocab_size);
+        x   = pool_.alloc1D(p->dim);
+        xb  = pool_.alloc1D(p->dim);
+        xb2 = pool_.alloc1D(p->dim);
+        hb  = pool_.alloc1D(p->hidden_dim);
+        hb2 = pool_.alloc1D(p->hidden_dim);
+        q   = pool_.alloc1D(p->dim);
+        key_cache   = pool_.alloc3D(p->n_layers, p->seq_len, kv_dim);
+        value_cache = pool_.alloc3D(p->n_layers, p->seq_len, kv_dim);
+        att    = pool_.alloc2D(p->n_heads, p->seq_len);
+        logits = pool_.alloc1D(p->vocab_size);
     }
     ~RunState() {}
 };
@@ -360,6 +367,10 @@ public:
     void loadParametersMMap() {
         mmap_.load(model_path_.c_str());
         float *ptr = mmap_.getPtr<float>(sizeof(Config));
+        long  size = mmap_.getMemSize() / sizeof(float);
+        ArrayPool<float> pool;
+        pool.useSpace(ptr, size);
+
         weights_ = new TransformerWeights;
         auto *w = weights_;
         auto *p = &cfg_;
@@ -367,32 +378,32 @@ public:
         int head_size = p->dim / p->n_heads;
         long n_layers = p->n_layers;
 
-        // from llama2.c/run.c
-        w->token_embedding_table = ptr;
-        ptr += p->vocab_size * p->dim;
-        w->rms_att_weight = ptr;
-        ptr += n_layers * p->dim;
-        w->wq = ptr;
-        ptr += n_layers * p->dim * (p->n_heads * head_size);
-        w->wk = ptr;
-        ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-        w->wv = ptr;
-        ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-        w->wo = ptr;
-        ptr += n_layers * (p->n_heads * head_size) * p->dim;
-        w->rms_ffn_weight = ptr;
-        ptr += n_layers * p->dim;
-        w->w1 = ptr;
-        ptr += n_layers * p->dim * p->hidden_dim;
-        w->w2 = ptr;
-        ptr += n_layers * p->hidden_dim * p->dim;
-        w->w3 = ptr;
-        ptr += n_layers * p->dim * p->hidden_dim;
-        w->rms_final_weight = ptr;
-        ptr += p->dim;
+#define mark_a1d(M, D1)         do { w->M = pool.alloc1D(D1);         } while (0)
+#define mark_a2d(M, D1, D2)     do { w->M = pool.alloc2D(D1, D2);     } while (0)
+#define mark_a3d(M, D1, D2, D3) do { w->M = pool.alloc3D(D1, D2, D3); } while (0)
+
+        mark_a2d(token_embedding_table, p->vocab_size, p->dim);
+        mark_a2d(rms_att_weight, n_layers, p->dim);
+
+        mark_a3d(wq, n_layers, p->dim, (p->n_heads * head_size));
+        mark_a3d(wk, n_layers, p->dim, (p->n_kv_heads * head_size));
+        mark_a3d(wv, n_layers, p->dim, (p->n_kv_heads * head_size));
+
+        mark_a3d(wo, n_layers, (p->n_heads * head_size), p->dim);
+        mark_a2d(rms_ffn_weight, n_layers, p->dim);
+
+        mark_a3d(w1, n_layers, p->dim, p->hidden_dim);
+        mark_a3d(w2, n_layers, p->hidden_dim, p->dim);
+        mark_a3d(w3, n_layers, p->dim, p->hidden_dim);
+
+        mark_a1d(rms_final_weight, p->dim);
+
         ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
         ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
-        w->wcls = shared_weights ? w->token_embedding_table : ptr;
+        if (shared_weights)
+            w->wcls = w->token_embedding_table;
+        else
+            w->wcls = pool.alloc2D(p->vocab_size, p->dim);
     }
     void dumpConfig() {
         std::cout << "Model Config:\ndim = " << cfg_.dim
@@ -415,11 +426,9 @@ public:
     }
 
     void forwardLayer(int pos, int i_layer) {
-        using namespace nn;
         Config* p = &cfg_;
         TransformerWeights* w = weights_;
         RunState *s = run_state_;
-        float    *x = s->x.data();  // activation at current time stamp (dim,)
 
         int dim    = p->dim;
         int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
@@ -428,17 +437,16 @@ public:
         int head_size  = dim / p->n_heads;
 
         // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + i_layer*dim, dim);
+        rmsnorm(s->xb, s->x, w->rms_att_weight[i_layer]);
 
         // key and value point to the kv cache
-        int loff = i_layer * p->seq_len * kv_dim; // kv cache layer offset for convenience
-        s->k = s->key_cache.data() + loff + pos * kv_dim;
-        s->v = s->value_cache.data() + loff + pos * kv_dim;
+        s->k = s->key_cache[i_layer, pos];
+        s->v = s->value_cache[i_layer, pos];
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + i_layer*dim*dim,    dim, dim);
-        matmul(s->k, s->xb, w->wk + i_layer*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + i_layer*dim*kv_dim, dim, kv_dim);
+        matmul(s->q, s->xb, w->wq[i_layer]);
+        matmul(s->k, s->xb, w->wk[i_layer]);
+        matmul(s->v, s->xb, w->wv[i_layer]);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
@@ -449,7 +457,7 @@ public:
             float fci = sinf(val);
             int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
             for (int v = 0; v < rotn; v++) {
-                float *vec = v == 0 ? s->q.data() : s->k; // the vector to rotate (query or key)
+                auto vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
                 float v0 = vec[i];
                 float v1 = vec[i+1];
                 vec[i]   = v0 * fcr - v1 * fci;
@@ -464,11 +472,11 @@ public:
             // get the query vector for this head
             float* q = s->q.data() + h * head_size;
             // attention scores for this head
-            float* att = s->att.data() + h * p->seq_len;
+            auto att = s->att[h];
             // iterate over all timesteps, including the current one
             for (int t = 0; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
-                float* k = s->key_cache.data() + loff + t * kv_dim + (h / kv_mul) * head_size;
+                float* k = s->key_cache[i_layer, t].data() + (h / kv_mul) * head_size;
                 // calculate the attention score as the dot product of q and k
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) {
@@ -487,7 +495,7 @@ public:
             memset(xb, 0, head_size * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 // get the value vector for this head and at this timestep
-                float* v = s->value_cache.data() + loff + t * kv_dim + (h / kv_mul) * head_size;
+                float* v = s->value_cache[i_layer, t].data() + (h / kv_mul) * head_size;
                 // get the attention weight for this timestep
                 float a = att[t];
                 // accumulate the weighted value into xb
@@ -498,20 +506,20 @@ public:
         }
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + i_layer*dim*dim, dim, dim);
+        matmul(s->xb2, s->xb, w->wo[i_layer]);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
-            x[i] += s->xb2[i];
+            s->x[i] += s->xb2[i];
         }
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + i_layer*dim, dim);
+        rmsnorm(s->xb, s->x, w->rms_ffn_weight[i_layer]);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + i_layer*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + i_layer*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb,  s->xb, w->w1[i_layer]);
+        matmul(s->hb2, s->xb, w->w3[i_layer]);
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -524,37 +532,38 @@ public:
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + i_layer*dim*hidden_dim, hidden_dim, dim);
+        matmul(s->xb, s->hb, w->w2[i_layer]);
 
         // residual connection
         for (int i = 0; i < dim; i++) {
-            x[i] += s->xb[i];
+            s->x[i] += s->xb[i];
         }
     }
 
     float* forward(int token, int pos) {
-        using namespace nn;
         // a few convenience variables
         Config* p = &cfg_;
         TransformerWeights* w = weights_;
         RunState *s = run_state_;
-        float    *x = s->x.data();  // activation at current time stamp (dim,)
+        //float    *x = s->x.data();  // activation at current time stamp (dim,)
 
-        int dim    = p->dim;
+        //int dim    = p->dim;
 
         // copy the token embedding into x
-        float* content_row = w->token_embedding_table + token * dim;
-        memcpy(x, content_row, dim*sizeof(*x));
+        auto content_row = w->token_embedding_table[token];
+        //memcpy(s->x, content_row, dim*sizeof(*x));
+        s->x.copy(content_row);
 
         // forward all the layers
         for(int l = 0; l < p->n_layers; l++)
             forwardLayer(pos, l);
 
         // final rmsnorm
-        rmsnorm(x, x, w->rms_final_weight, dim);
+        rmsnorm(s->x, s->x, w->rms_final_weight);
 
         // classifier into logits
-        matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+        matmul(s->logits.data(), s->x.data(), w->wcls.raw(), p->dim, p->vocab_size); // fixme
+        //matmul(s->logits, s->x, w->wcls);
         return s->logits.data();
     }
 

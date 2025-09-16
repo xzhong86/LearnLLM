@@ -1,5 +1,6 @@
 
 #include <cmath>
+#include "arrays.hpp"
 
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
@@ -50,6 +51,34 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
             val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+}
+
+
+void rmsnorm(Array1D<float> o, Array1D<float> x, Array1D<float> w) {
+    assert_msg(o.size() == x.size() && x.size() == w.size(), "mismatch");
+    rmsnorm(o.data(), x.data(), w.data(), w.size());
+}
+
+void softmax(Array1D<float> x, int size) {
+    assert_msg(size <= x.size(), "overflow");
+    softmax(x.data(), size);
+}
+
+// W (d,n) @ X (n,) -> XOUT (d,)
+//void matmul(float* xout, float* x, float* w, int n, int d)
+void matmul(Array1D<float> xout, Array1D<float> x, Array2D<float> w) {
+    int n = w.d1size();
+    int d = w.d2size();
+    assert_msg(x.size()    == n, "mismatch");
+    assert_msg(xout.size() == d, "mismatch");
+    for (int i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w.raw()[i * n + j] * x[j];
+            //val += w[i,j] * x[j];
         }
         xout[i] = val;
     }

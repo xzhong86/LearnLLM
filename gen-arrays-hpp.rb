@@ -3,13 +3,17 @@
 $base_array1d = """
 template <typename T>
 class Array1D {
-    T * const data_;
-    const int dim_;
+    T * data_;
+    int dim_;
 public:
+    Array1D() : data_(nullptr), dim_(0) {}
     Array1D(T* data, int dim) : data_(data), dim_(dim) {}
-    Array1D(std::vector<T> &v) : data_(v.data()), dim_(v.size()) {}
-    T*  data() const { return data; }
+    T*  data() const { return data_; }
     int size() const { return dim_; }
+    void copy(const Array1D<T> &from) {
+         assert_msg(from.dim_ == dim_, \"mismatch\");
+         for (int i = 0; i < dim_; i++) data_[i] = from.data_[i];
+    }
     T& operator[](int i) const { return data_[i]; }
 };
 """
@@ -45,17 +49,19 @@ class CodeGen
 end
 
 def gen_ArrayXD(cgen, dim)
-  fail if dim < 2
+  fail "bad dim" if dim < 2
   cls_name = "Array#{dim}D"
   cgen.puts "template <typename T>"
   cgen.put_block("class #{cls_name}", "{", "};") do
-    cgen.puts "T * const data_;"
-    cgen.puts "const int " + "dim{}_".map_sub_join(1..dim) + ";"
+    cgen.puts "T * data_;"
+    cgen.puts "int " + "dim{}_".map_sub_join(1..dim) + ";"
     cgen.puts "public:"
+    cgen.puts("#{cls_name}() : data_(nullptr), " + "dim{}_(0)".map_sub_join(1..dim) + " {}")
     cgen.puts("#{cls_name}(T *data, " + "int dim{}".map_sub_join(1..dim) +
               ") : data_(data), " + "dim{}_(dim{})".map_gsub_join(1..dim) +
               " {}")
     cgen.puts "long size() const { return 1L * " + "dim{}_".map_sub_join(1..dim, " * ") + "; }"
+    cgen.puts "T*   raw()  const { return data_; }"
     1.upto(dim){ |d| cgen.puts "int d#{d}size() const { return dim#{d}_; }" }
     cgen.put_block("T& operator[](" + "int d{}".map_sub_join(1..dim) + ") const") do
       darr = 1.upto(dim).map{|d| (d..dim).to_a }
@@ -76,12 +82,50 @@ def gen_ArrayXD(cgen, dim)
   end
 end
 
+def gen_ArrayPool(cgen, max_dim)
+  cgen.puts "template <typename T>"
+  cgen.put_block("class ArrayPool", "{", "};") do
+    lines = """
+    |  T * pool_;
+    |  T * ptr_ = nullptr;
+    |  long size_ = 0;
+    |  bool no_del_ = false;
+    |public:
+    |  ArrayPool() : pool_(nullptr) {}
+    |  ArrayPool(long size) : pool_(new T[size]), size_(size) {
+    |      ptr_ = pool_;
+    |  }
+    |  ~ArrayPool() { if (!no_del_) delete [] pool_; }
+    |  void alloc(long size) {
+    |      assert_msg(pool_ == nullptr, \"not empty\");
+    |      pool_ = new T[size]; size_ = size; ptr_ = pool_;
+    |  }
+    |  void useSpace(T *p, long size) {
+    |      assert_msg(pool_ == nullptr, \"not empty\");
+    |      pool_ = p; size_ = size; ptr_ = pool_; no_del_ = true;
+    |  }
+    |"""
+    lines.lines.map{|l| l.chomp.sub(/^\s+\|/,'') }.each{|l| cgen.puts l if l.length > 0 }
+    (1..max_dim).each do |dim|
+      cgen.put_block("Array#{dim}D<T> alloc#{dim}D(" + "int d{}".map_sub_join(1..dim) + ")") do
+        cgen.puts "auto a = Array#{dim}D<T>(ptr_, " + "d{}".map_sub_join(1..dim) + ");"
+        cgen.puts "ptr_ += a.size();"
+        cgen.puts "assert_msg(ptr_ <= pool_ + size_, \"overflow\");"
+        cgen.puts "return a;"
+      end
+    end
+  end
+end
+
+# main
+
 puts "#pragma once"
+puts "#include \"llm-utils.hpp\""
 puts "namespace nn {"
+puts "using namespace llm;"
 puts $base_array1d
 cgen = CodeGen.new
-gen_ArrayXD(cgen, 2)
-gen_ArrayXD(cgen, 3)
-gen_ArrayXD(cgen, 4)
-#gen_ArrayXD(cgen, 5)
+max_dim = 4
+(2..max_dim).each{|d| gen_ArrayXD(cgen, d) }
+gen_ArrayPool(cgen, max_dim)
 puts "}"
