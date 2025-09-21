@@ -1,23 +1,5 @@
 #!/usr/bin/env ruby
 
-$base_array1d = """
-template <typename T>
-class Array1D {
-    T * data_;
-    int dim_;
-public:
-    Array1D() : data_(nullptr), dim_(0) {}
-    Array1D(T* data, int dim) : data_(data), dim_(dim) {}
-    T*  data() const { return data_; }
-    int size() const { return dim_; }
-    void copy(const Array1D<T> &from) {
-         assert_msg(from.dim_ == dim_, \"mismatch\");
-         for (int i = 0; i < dim_; i++) data_[i] = from.data_[i];
-    }
-    T& operator[](int i) const { return data_[i]; }
-};
-"""
-
 class String
   def map_sub_join(values, sep = ", ")
     values.map{ |v| self.sub('{}', v.to_s) }.join(sep)
@@ -39,12 +21,20 @@ class CodeGen
   def puts(str)
     io_puts indent_spc() + str
   end
+  def put_lines(lines_str, strip=/^\s+\|/)
+    strip ||= /^--DuMmY--/  # match nothind if no strip 
+    lines = lines_str.lines.map{|l| l.chomp.sub(strip,'') }
+    lines.each{|l| puts l if l.length > 0 }
+  end
   def put_block(prefix, sob = "{", eob = "}")
     puts prefix + " " + sob
     @indent += 1
     yield
     @indent -= 1
     puts eob
+  end
+  def put_class(clsname)
+    put_block("class #{clsname} ", "{", "};"){ yield }
   end
 end
 
@@ -57,7 +47,7 @@ def gen_ArrayXD(cgen, dim)
 
   cls_name = "Array#{dim}D"
   cgen.puts "template <typename T>"
-  cgen.put_block("class #{cls_name}", "{", "};") do
+  cgen.put_class(cls_name) do
     cgen.puts "T * data_;"
     cgen.puts "int " + "dim{}_".map_sub_join(1..dim) + ";"
     cgen.puts "public:"
@@ -91,7 +81,7 @@ end
 
 def gen_ArrayPool(cgen, max_dim)
   cgen.puts "template <typename T>"
-  cgen.put_block("class ArrayPool", "{", "};") do
+  cgen.put_class("ArrayPool") do
     lines = """
     |  T * pool_;
     |  T * ptr_ = nullptr;
@@ -112,7 +102,8 @@ def gen_ArrayPool(cgen, max_dim)
     |      pool_ = p; size_ = size; ptr_ = pool_; no_del_ = true;
     |  }
     |"""
-    lines.lines.map{|l| l.chomp.sub(/^\s+\|/,'') }.each{|l| cgen.puts l if l.length > 0 }
+    #lines.lines.map{|l| l.chomp.sub(/^\s+\|/,'') }.each{|l| cgen.puts l if l.length > 0 }
+    cgen.put_lines(lines)
     (1..max_dim).each do |dim|
       cgen.put_block("Array#{dim}D<T> alloc#{dim}D(" + "int d{}".map_sub_join(1..dim) + ")") do
         cgen.puts "auto a = Array#{dim}D<T>(ptr_, " + "d{}".map_sub_join(1..dim) + ");"
@@ -126,13 +117,33 @@ end
 
 # main
 
-puts "#pragma once"
-puts "#include \"llm-utils.hpp\""
-puts "namespace nn {"
-puts "using namespace llm;"
-puts $base_array1d
 cgen = CodeGen.new
+
+cgen.puts "#pragma once"
+cgen.puts "#include \"llm-utils.hpp\""
+cgen.puts "namespace nn {"
+cgen.puts "using namespace llm;"
+
+cgen.put_lines("""
+template <typename T>
+class Array1D {
+    T * data_;
+    int dim_;
+public:
+    Array1D() : data_(nullptr), dim_(0) {}
+    Array1D(T* data, int dim) : data_(data), dim_(dim) {}
+    T*  data() const { return data_; }
+    int size() const { return dim_; }
+    void copy(const Array1D<T> &from) {
+         assert_msg(from.dim_ == dim_, \"mismatch\");
+         for (int i = 0; i < dim_; i++) data_[i] = from.data_[i];
+    }
+    T& operator[](int i) const { return data_[i]; }
+};
+""")
+
 max_dim = 4
 (2..max_dim).each{|d| gen_ArrayXD(cgen, d) }
 gen_ArrayPool(cgen, max_dim)
-puts "}"
+
+cgen.puts "}"
